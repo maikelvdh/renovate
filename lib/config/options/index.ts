@@ -3164,6 +3164,7 @@ const options: Readonly<RenovateOptions>[] = [
     supportedManagers: [
       'bundler',
       'composer',
+      'gh-aw',
       'github-actions',
       'gomod',
       'mise',

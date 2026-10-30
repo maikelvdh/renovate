@@ -20,6 +20,7 @@ import {
   WORKER_FILE_UPDATE_FAILED,
 } from '../../../../constants/error-messages.ts';
 import { logger, removeMeta } from '../../../../logger/index.ts';
+import { updateAgenticWorkflows } from '../../../../modules/manager/gh-aw/artifacts.ts';
 import { updateActionsLockfile } from '../../../../modules/manager/github-actions/artifacts.ts';
 import { enforcesMinimumReleaseAge } from '../../../../modules/manager/index.ts';
 import { getAdditionalFiles } from '../../../../modules/manager/npm/post-update/index.ts';
@@ -681,6 +682,20 @@ export async function processBranch(
       );
       config.updatedArtifacts = coerceArray(config.updatedArtifacts).concat(
         additionalFiles.updatedArtifacts,
+      );
+      // `gh aw compile` regenerates every compiled agentic workflow from all of the sources and `actions-lock.json`, so it also runs once here, ahead of `gh actions-lock` so that one sees the compiled workflows.
+      const agenticWorkflows = await updateAgenticWorkflows(
+        config,
+        branchConfig.packageFiles,
+      );
+      config.artifactErrors = config.artifactErrors.concat(
+        agenticWorkflows.artifactErrors,
+      );
+      config.artifactNotices = config.artifactNotices.concat(
+        agenticWorkflows.artifactNotices,
+      );
+      config.updatedArtifacts = config.updatedArtifacts.concat(
+        agenticWorkflows.updatedArtifacts,
       );
       // `gh actions-lock` rewrites the whole lockfile from the workflows on disk, so like the lock files above it runs once here, after every updated package file has been written, rather than per package file.
       const actionsLockfile = await updateActionsLockfile(

@@ -73,12 +73,15 @@ Renovate keeps the [GitHub Actions dependency lockfile](https://github.com/githu
 The lockfile is an alternative to inline digest pinning: your workflows keep readable tags like `actions/checkout@v4.3.1`, and `.github/workflows/actions.lock` records the commit each tag resolved to.
 
 If the repository has a `.github/workflows/actions.lock`, then Renovate regenerates it whenever it updates an action.
-Renovate installs the [`gh-actions-lock`](https://github.com/github/gh-actions-lock) extension for the `gh` CLI, and runs `gh actions-lock` once per branch, from the repository root, after writing every updated workflow:
+Renovate installs the [`gh-actions-lock`](https://github.com/github/gh-actions-lock) extension for the `gh` CLI, into a directory for that version below the [`cacheDir`](../../../self-hosted-configuration.md#cachedir) which `XDG_DATA_HOME` points `gh` at, and runs `gh actions-lock` once per branch, from the repository root, after writing every updated workflow.
+Renovate downloads each version only once, and removes the versions which no repository used for 30 days:
 
 ```sh
-gh extension install github/gh-actions-lock --pin <version> --force
+gh extension install github/gh-actions-lock --pin <version>
 gh actions-lock --no-interactive --no-onboard --no-narrow --ignore-local-actions --json=findings
 ```
+
+If several Renovate processes share a `cacheDir`, then they can install the same version at the same time, which fails one of them with an artifact error until its next run.
 
 Renovate invokes `gh actions-lock` in a way that keeps the diff to the dependency being updated, by re-resolving only the refs which have changed, along with anything new they pull in transitively.
 Every other pin stays as locked, including floating refs (like `@v4`) which have since moved upstream.
@@ -151,6 +154,20 @@ You can also control the `gh` CLI version using `constraints.gh`.
   `gh actions-lock` resolves refs and repository IDs through the GitHub API, so it needs a token.
   Renovate takes the token from the `github` host rule matching your platform endpoint, and passes it as `GH_TOKEN`.
   On GitHub Enterprise Server Renovate passes that token using `GH_ENTERPRISE_TOKEN` and `GH_HOST`, and additionally passes the token from your `github.com` host rule as `GH_TOKEN`, because public actions are still resolved against `github.com`.
+
+### GitHub Agentic Workflows
+
+Renovate skips the dependencies of the workflows which [`gh aw compile`](https://github.github.com/gh-aw/) generates (`.github/workflows/*.lock.yml` with a `gh-aw` header), with the `generated-file` skip reason, because the next compile would undo any change to them.
+The [`gh-aw`](../gh-aw/index.md) manager updates their pins in `.github/aw/actions-lock.json` and the `.md` sources instead, and recompiles them.
+
+If `actions.lock` tracks a compiled workflow which the branch recompiled, then Renovate regenerates the lockfile for it too, ahead of the run above:
+
+```sh
+gh actions-lock --no-interactive --no-narrow --ignore-local-actions --json=findings <recompiled workflows>
+```
+
+Renovate names the recompiled workflows rather than passing `--no-onboard`, as a new `gh aw` release can add an action which the workflow did not use before, which `--no-onboard` would leave out of the lockfile with only a warning.
+Workflows which are not onboarded are still skipped.
 
 ### Non-semver refs (branches and feature tags)
 

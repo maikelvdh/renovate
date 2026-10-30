@@ -58,6 +58,12 @@ export const additionalConstraintDefinitions =
 
 Must be a full release tag, prefixed with \`v\`, such as \`v0.1.7\`. Set it to an empty string to always install the latest release.`,
     },
+    {
+      name: 'ghAw',
+      description: `Used in the \`gh-aw\` manager to specify a release tag for the [\`github/gh-aw\`](https://github.com/github/gh-aw) \`gh\` CLI extension, which compiles the agentic workflows.
+
+Must be a full release tag, prefixed with \`v\`, such as \`v1.0.1\`. Defaults to the version of the \`github/gh-aw-actions/setup\` action in \`.github/aw/actions-lock.json\`, else the latest release.`,
+    },
     /**
      * @deprecated TODO remove in #42600
      */

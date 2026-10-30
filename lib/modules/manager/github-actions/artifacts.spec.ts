@@ -9,7 +9,7 @@ import type {
   RepoGlobalConfig,
 } from '../../../config/types.ts';
 import { TEMPORARY_ERROR } from '../../../constants/error-messages.ts';
-import type { StatusResult } from '../../../util/git/types.ts';
+import type { FileChange, StatusResult } from '../../../util/git/types.ts';
 import type { PackageFile, PostUpdateConfig, Upgrade } from '../types.ts';
 import { updateActionsLockfile } from './artifacts.ts';
 
@@ -120,6 +120,10 @@ function mockLockfileRegenerated(): void {
 describe('modules/manager/github-actions/artifacts', () => {
   beforeEach(() => {
     GlobalConfig.set(adminConfig);
+    fs.ensureCacheDir.mockImplementation((name: string) =>
+      Promise.resolve(`/tmp/cache/others/${name}`),
+    );
+    fs.listCacheDir.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -354,15 +358,22 @@ describe('modules/manager/github-actions/artifacts', () => {
           contents: `${actionsLock}# updated\n`,
         },
       ]);
-      // runs from the repo root, since the tool re-resolves every workflow
+      // runs from the repo root, since the tool re-resolves every workflow, with the extension installed for its own release tag
+      const extensionDir = `/tmp/cache/others/gh-extensions/github/gh-actions-lock/${actionsLockVersion}`;
       expect(execSnapshots).toMatchObject([
         {
-          cmd: `gh extension install github/gh-actions-lock --force --pin ${actionsLockVersion}`,
-          options: { cwd: '/tmp/github/some/repo' },
+          cmd: `gh extension install github/gh-actions-lock --pin ${actionsLockVersion}`,
+          options: {
+            cwd: '/tmp/github/some/repo',
+            env: { XDG_DATA_HOME: extensionDir },
+          },
         },
         {
           cmd: 'gh actions-lock --no-interactive --no-onboard --no-narrow --ignore-local-actions --json=findings',
-          options: { cwd: '/tmp/github/some/repo' },
+          options: {
+            cwd: '/tmp/github/some/repo',
+            env: { XDG_DATA_HOME: extensionDir },
+          },
         },
       ]);
     });
@@ -464,6 +475,105 @@ describe('modules/manager/github-actions/artifacts', () => {
         { path: releaseFileName, contents: annotate('release workflow') },
       ]);
     });
+
+    it('leaves a workflow which another tool of the branch already rewrote to it', async () => {
+      mockExecAll();
+      fs.readLocalFile
+        .mockResolvedValueOnce(actionsLock)
+        .mockResolvedValueOnce(`${actionsLock}# updated\n`)
+        .mockResolvedValueOnce('updated workflow')
+        .mockResolvedValueOnce('compiled release workflow');
+      mockRepoStatus([lockFile, packageFileName, releaseFileName]);
+
+      const res = await updateActionsLockfile(
+        makeConfig({
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: releaseFileName,
+              contents: 'compiled release workflow',
+            },
+            { type: 'deletion', path: 'removed.yml' },
+          ],
+        }),
+        twoWorkflows,
+      );
+
+      expect(res.updatedArtifacts).toMatchObject([{ path: lockFile }]);
+    });
+
+    it('locks a workflow which another tool of the branch regenerated', async () => {
+      const execSnapshots = mockExecAll();
+      fs.readLocalFile
+        .mockResolvedValueOnce(actionsLock)
+        .mockResolvedValueOnce(`${actionsLock}# updated\n`);
+      mockRepoStatus([lockFile]);
+
+      const res = await updateActionsLockfile(
+        makeConfig({
+          upgrades: [],
+          updatedPackageFiles: [],
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: releaseFileName,
+              contents: 'compiled release workflow',
+            },
+          ],
+        }),
+        twoWorkflows,
+      );
+
+      expect(res.updatedArtifacts).toMatchObject([{ path: lockFile }]);
+      // only that workflow, and onboarding the actions it did not use before
+      expect(execSnapshots.at(-1)?.cmd).toBe(
+        `gh actions-lock --no-interactive --no-narrow --ignore-local-actions --json=findings ${releaseFileName}`,
+      );
+    });
+
+    it('locks a regenerated workflow ahead of the branch updates', async () => {
+      const execSnapshots = mockExecAll();
+      mockLockfileRegenerated();
+
+      await updateActionsLockfile(
+        makeConfig({
+          updatedArtifacts: [
+            {
+              type: 'addition',
+              path: releaseFileName,
+              contents: 'compiled release workflow',
+            },
+          ],
+        }),
+        twoWorkflows,
+      );
+
+      expect(execSnapshots.slice(-2).map(({ cmd }) => cmd)).toEqual([
+        `gh actions-lock --no-interactive --no-narrow --ignore-local-actions --json=findings ${releaseFileName}`,
+        'gh actions-lock --no-interactive --no-onboard --no-narrow --ignore-local-actions --json=findings',
+      ]);
+    });
+
+    it.each`
+      reason                 | file
+      ${'is not onboarded'}  | ${{ type: 'addition', path: '.github/workflows/other.yml', contents: 'x' }}
+      ${'is not a workflow'} | ${{ type: 'addition', path: '.github/aw/actions-lock.json', contents: 'x' }}
+      ${'was deleted'}       | ${{ type: 'deletion', path: releaseFileName }}
+    `(
+      'does nothing for a regenerated file which $reason',
+      async ({ file }: { file: FileChange }) => {
+        const execSnapshots = mockExecAll();
+        fs.readLocalFile.mockResolvedValueOnce(actionsLock);
+
+        const res = await updateActionsLockfile(
+          makeConfig({ upgrades: [], updatedArtifacts: [file] }),
+          twoWorkflows,
+        );
+
+        expect(res.updatedArtifacts).toBeEmptyArray();
+        expect(execSnapshots).toBeEmptyArray();
+      },
+    );
 
     it('leaves files this manager does not own to their own manager', async () => {
       mockExecAll();
@@ -567,7 +677,7 @@ describe('modules/manager/github-actions/artifacts', () => {
       );
 
       expect(execSnapshots[0].cmd).toBe(
-        'gh extension install github/gh-actions-lock --force --pin v0.1.7-rc.1',
+        'gh extension install github/gh-actions-lock --pin v0.1.7-rc.1',
       );
     });
 
@@ -595,7 +705,7 @@ describe('modules/manager/github-actions/artifacts', () => {
         );
 
         expect(execSnapshots[0].cmd).toBe(
-          `gh extension install github/gh-actions-lock --force --pin ${quoted}`,
+          `gh extension install github/gh-actions-lock --pin ${quoted}`,
         );
       },
     );
@@ -865,7 +975,7 @@ describe('modules/manager/github-actions/artifacts', () => {
 
       expect(execSnapshots[0].options?.env).not.toHaveProperty('GH_TOKEN');
       expect(logger.logger.debug).toHaveBeenCalledWith(
-        'No GitHub token found for `gh actions-lock`',
+        'No GitHub token found for the `gh` CLI',
       );
     });
   });

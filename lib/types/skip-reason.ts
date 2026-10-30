@@ -47,6 +47,10 @@ export type SkipReason =
   | 'github-token-required'
   | 'inherited-dependency'
   /**
+   * The dependency is in a file which another tool generates, and would undo any change to, such as a workflow compiled by `gh aw compile`.
+   */
+  | 'generated-file'
+  /**
    * The dependency has been detected as explicitly malicious.
    *
    * This reason should be removed before the update phase, so updates can be determined.

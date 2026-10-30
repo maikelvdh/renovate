@@ -14,6 +14,7 @@ import {
   REPOSITORY_CHANGED,
 } from '../../../../constants/error-messages.ts';
 import { logger } from '../../../../logger/index.ts';
+import * as _ghAwArtifacts from '../../../../modules/manager/gh-aw/artifacts.ts';
 import * as _githubActionsArtifacts from '../../../../modules/manager/github-actions/artifacts.ts';
 import * as _managers from '../../../../modules/manager/index.ts';
 import * as _npmPostExtract from '../../../../modules/manager/npm/post-update/index.ts';
@@ -56,6 +57,7 @@ vi.mock('./get-updated.ts');
 vi.mock('./schedule.ts');
 vi.mock('./check-existing.ts');
 vi.mock('./reuse.ts');
+vi.mock('../../../../modules/manager/gh-aw/artifacts.ts');
 vi.mock('../../../../modules/manager/github-actions/artifacts.ts');
 vi.mock('../../../../modules/manager/npm/post-update/index.ts');
 vi.mock('../../../../modules/manager/index.ts', async (importOriginal) => ({
@@ -79,6 +81,7 @@ const schedule = vi.mocked(_schedule);
 const checkExisting = vi.mocked(_checkExisting);
 const reuse = vi.mocked(_reuse);
 const npmPostExtract = vi.mocked(_npmPostExtract);
+const ghAwArtifacts = vi.mocked(_ghAwArtifacts);
 const githubActionsArtifacts = vi.mocked(_githubActionsArtifacts);
 const managers = vi.mocked(_managers);
 const automerge = vi.mocked(_automerge);
@@ -122,6 +125,11 @@ describe('workers/repository/update/branch/index', () => {
     };
 
     beforeEach(() => {
+      ghAwArtifacts.updateAgenticWorkflows.mockResolvedValue({
+        updatedArtifacts: [],
+        artifactErrors: [],
+        artifactNotices: [],
+      });
       githubActionsArtifacts.updateActionsLockfile.mockResolvedValue({
         updatedArtifacts: [],
         artifactErrors: [],
@@ -3730,6 +3738,45 @@ describe('workers/repository/update/branch/index', () => {
 
       expect(commit.commitFilesToBranch).toHaveBeenCalledWith(
         expect.objectContaining({ updatedArtifacts: [lockFile] }),
+      );
+    });
+
+    it('merges the compiled agentic workflows into the commit, ahead of the GitHub Actions lockfile', async () => {
+      const compiled = partial<FileChange>({
+        type: 'addition',
+        path: '.github/workflows/triage.lock.yml',
+      });
+      const notice = { file: '.github/workflows/actions.lock', message: 'x' };
+      getUpdated.getUpdatedPackageFiles.mockResolvedValueOnce(
+        partial<PackageFilesResult>({
+          updatedPackageFiles: [partial<FileChange>()],
+          artifactErrors: [],
+          updatedArtifacts: [],
+        }),
+      );
+      npmPostExtract.getAdditionalFiles.mockResolvedValueOnce({
+        artifactErrors: [],
+        updatedArtifacts: [],
+      });
+      ghAwArtifacts.updateAgenticWorkflows.mockResolvedValueOnce({
+        artifactErrors: [],
+        updatedArtifacts: [compiled],
+        artifactNotices: [notice],
+      });
+
+      await branchWorker.processBranch(config);
+
+      expect(commit.commitFilesToBranch).toHaveBeenCalledWith(
+        expect.objectContaining({
+          updatedArtifacts: [compiled],
+          artifactNotices: [notice],
+        }),
+      );
+      expect(
+        ghAwArtifacts.updateAgenticWorkflows.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        githubActionsArtifacts.updateActionsLockfile.mock
+          .invocationCallOrder[0],
       );
     });
 

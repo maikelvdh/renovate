@@ -16,6 +16,7 @@ import * as dockerVersioning from '../../versioning/docker/index.ts';
 import * as exactVersioning from '../../versioning/exact/index.ts';
 import * as githubActionsVersioning from '../../versioning/github-actions/index.ts';
 import { getDep } from '../dockerfile/extract.ts';
+import { isCompiledWorkflow } from '../gh-aw/common.ts';
 import type {
   ExtractConfig,
   PackageDependency,
@@ -402,6 +403,14 @@ export async function extractPackageFile(
   }
 
   const res: PackageFileContent = { deps };
+
+  if (isCompiledWorkflow(packageFile, content)) {
+    // `gh aw compile` regenerates the file from its `.md` source, so the `gh-aw` manager updates the pins there instead
+    for (const dep of deps) {
+      dep.skipReason ??= 'generated-file';
+    }
+    return res;
+  }
 
   if (await isManagedByLockfile(packageFile)) {
     // Deliberately no `lockFiles`: nothing here goes through `updateArtifacts`, and `matchFileNames` also tests `lockFiles`, so declaring it would make a negated rule such as `!.github/workflows/release.yml` match every workflow through the lock file path.

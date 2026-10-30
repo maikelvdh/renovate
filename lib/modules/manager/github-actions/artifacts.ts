@@ -3,22 +3,26 @@ import { GlobalConfig } from '../../../config/global.ts';
 import { TEMPORARY_ERROR } from '../../../constants/error-messages.ts';
 import { logger } from '../../../logger/index.ts';
 import { coerceArray } from '../../../util/array.ts';
-import { findGithubToken } from '../../../util/check-token.ts';
-import { detectPlatform } from '../../../util/common.ts';
 import { exec } from '../../../util/exec/index.ts';
-import type { ExecOptions, ExtraEnv } from '../../../util/exec/types.ts';
+import type { ExecOptions } from '../../../util/exec/types.ts';
 import { readLocalFile, writeLocalFile } from '../../../util/fs/index.ts';
 import { getRepoStatus } from '../../../util/git/index.ts';
 import type { FileChange } from '../../../util/git/types.ts';
-import * as hostRules from '../../../util/host-rules.ts';
-import { parseUrl } from '../../../util/url.ts';
+import {
+  getGhExtensionInstall,
+  getGhTokenEnv,
+} from '../../../util/github/gh-cli.ts';
 import { api as semver } from '../../versioning/semver/index.ts';
 import type { PackageFile, PostUpdateConfig, Upgrade } from '../types.ts';
 import {
   artifactErrorMessageFromExecError,
   resolveToolConstraint,
 } from '../util.ts';
-import { actionsLockFile, isLockfileManaged } from './common.ts';
+import {
+  actionsLockFile,
+  githubWorkflowFileRe,
+  isLockfileManaged,
+} from './common.ts';
 import { ActionsLockfile, type Finding, FindingsOutput } from './schema.ts';
 import type { ActionsLockfileResult, OnboardedWorkflows } from './types.ts';
 
@@ -38,50 +42,6 @@ function needsRelock(version: string | undefined): boolean {
     semver.isVersion(version) &&
     semver.isGreaterThan(minPlainRunVersion, version)
   );
-}
-
-function findToken(url: string): string | undefined {
-  return findGithubToken(hostRules.find({ hostType: 'github', url }));
-}
-
-/**
- * `gh` takes the token from a different variable for GitHub Enterprise Server, and has to be told which host to talk to.
- *
- * Public actions are still resolved against github.com from there, so pass a token for both hosts.
- */
-function getTokenEnv(): ExtraEnv {
-  const githubComEndpoint = 'https://api.github.com/';
-  const configuredEndpoint = GlobalConfig.get('endpoint');
-  // The configured endpoint only says where GitHub lives when Renovate is talking to GitHub: workflows mirrored onto another platform still resolve their actions against github.com.
-  const endpoint =
-    configuredEndpoint && detectPlatform(configuredEndpoint) === 'github'
-      ? configuredEndpoint
-      : githubComEndpoint;
-
-  const hostname = parseUrl(endpoint)?.hostname;
-  const isEnterprise =
-    !!hostname && hostname !== 'api.github.com' && hostname !== 'github.com';
-
-  const env: ExtraEnv = {};
-
-  if (isEnterprise) {
-    const enterpriseToken = findToken(endpoint);
-    if (enterpriseToken) {
-      env.GH_HOST = hostname;
-      env.GH_ENTERPRISE_TOKEN = enterpriseToken;
-    }
-  }
-
-  const token = findToken(githubComEndpoint);
-  if (token) {
-    env.GH_TOKEN = token;
-  }
-
-  if (!Object.keys(env).length) {
-    logger.debug('No GitHub token found for `gh actions-lock`');
-  }
-
-  return env;
 }
 
 /**
@@ -107,6 +67,24 @@ function getLockedUpgrades(
 
     return isLockfileManaged(packageFile, onboardedWorkflows);
   });
+}
+
+/**
+ * The onboarded workflows which another tool of the branch regenerated, such as `gh aw compile` for the compiled agentic workflows.
+ * Their `uses:` changed without an update of this manager, so the lockfile has to follow them.
+ */
+function getRegeneratedWorkflows(
+  config: PostUpdateConfig,
+  onboardedWorkflows: OnboardedWorkflows,
+): string[] {
+  return coerceArray<FileChange>(config.updatedArtifacts)
+    .filter(
+      (file) =>
+        file.type === 'addition' &&
+        githubWorkflowFileRe.test(file.path) &&
+        file.path in onboardedWorkflows,
+    )
+    .map((file) => file.path);
 }
 
 /** One line per finding, followed by how the tool suggests fixing it. */
@@ -164,7 +142,11 @@ export async function updateActionsLockfile(
     config,
     parsedLockfile.data.workflows,
   );
-  if (!lockedUpgrades.length) {
+  const regeneratedWorkflows = getRegeneratedWorkflows(
+    config,
+    parsedLockfile.data.workflows,
+  );
+  if (!lockedUpgrades.length && !regeneratedWorkflows.length) {
     logger.debug(`No locked dependencies updated for ${actionsLockFile}`);
     return empty;
   }
@@ -186,24 +168,13 @@ export async function updateActionsLockfile(
     }
   }
 
-  const tokenEnv = getTokenEnv();
+  const tokenEnv = getGhTokenEnv();
 
   const ghConstraint = await resolveToolConstraint(config, 'gh');
   const ghActionsLockConstraint = await resolveToolConstraint(
     config,
     'ghActionsLock',
   );
-
-  const execOptions: ExecOptions = {
-    // The tool rescans every workflow, so it runs from the repository root
-    cwd: GlobalConfig.get('localDir'),
-    // `extraEnv` is what forwards a variable into the Docker sidecar, but on its own it is only a default: `getChildEnv` lets a same-named variable in Renovate's own environment win.
-    // The token we resolved from the host rules must not be shadowed by an ambient `GH_TOKEN`, so force it as well.
-    extraEnv: tokenEnv,
-    env: tokenEnv,
-    toolConstraints: [{ toolName: 'gh', constraint: ghConstraint }],
-    docker: {},
-  };
 
   // A replacement introduces a package the workflow did not use before, which `--no-onboard` refuses to add
   const hasReplacement = lockedUpgrades.some(
@@ -215,13 +186,13 @@ export async function updateActionsLockfile(
     GlobalConfig.get('binarySource') !== 'global' &&
     needsRelock(ghActionsLockConstraint);
 
-  // From v0.3.0 a plain run re-pins only the refs whose `uses:` changed, and keeps moved floating refs (like `@v4`) locked, so unrelated pins do not advance.
-  // Before that, a plain run refuses to write when a path or composite action's floating ref has moved, so `--relock` is needed there
-  const flags = [
+  const leadingFlags = [
     // we have no terminal to answer prompts with
     '--no-interactive',
-    // do not add workflows which the lockfile does not track yet, as that is unrelated to the update. Omitted for a replacement, as the new action is not in the workflow's lockfile entry yet
-    ...(hasReplacement ? [] : ['--no-onboard']),
+  ];
+  // From v0.3.0 a plain run re-pins only the refs whose `uses:` changed, and keeps moved floating refs (like `@v4`) locked, so unrelated pins do not advance.
+  // Before that, a plain run refuses to write when a path or composite action's floating ref has moved, so `--relock` is needed there
+  const trailingFlags = [
     // keep the ref that we wrote, to avoid a `@v4` being rewritten as `@v4.2.1`
     '--no-narrow',
     ...(relock
@@ -238,27 +209,53 @@ export async function updateActionsLockfile(
     // print the findings as JSON on stdout, so a failure can be reported readably. Available since v0.1.6
     '--json=findings',
   ];
-  const commands = [`gh actions-lock ${flags.join(' ')}`];
+  const commands: string[] = [];
+  if (regeneratedWorkflows.length) {
+    // A regenerated workflow may use an action it did not use before, such as one which a new `gh aw` release injects, which `--no-onboard` would refuse with only a warning, leaving it unlocked.
+    // Naming the workflows instead keeps the run from onboarding any other workflow
+    const flags = [...leadingFlags, ...trailingFlags];
+    commands.push(
+      `gh actions-lock ${flags.join(' ')} ${regeneratedWorkflows.map(quote).join(' ')}`,
+    );
+  }
+  if (lockedUpgrades.length) {
+    const flags = [
+      ...leadingFlags,
+      // do not add workflows which the lockfile does not track yet, as that is unrelated to the update. Omitted for a replacement, as the new action is not in the workflow's lockfile entry yet
+      ...(hasReplacement ? [] : ['--no-onboard']),
+      ...trailingFlags,
+    ];
+    commands.push(`gh actions-lock ${flags.join(' ')}`);
+  }
 
   // `binarySource=global` means the administrator provisions tooling, so we must not reach into their `gh` install to add or re-pin an extension.
   // They own the extension version, and `constraints.ghActionsLock` does not apply.
   // TODO replace once containerbase/base#7279 is available
-  if (GlobalConfig.get('binarySource') === 'global') {
+  const install = await getGhExtensionInstall(
+    extensionName,
+    ghActionsLockConstraint,
+  );
+  if (install) {
+    commands.unshift(...install.commands);
+  } else {
     // Debug rather than warn: `constraints.ghActionsLock` ships with a default, so we cannot tell an explicit override from the default here, and warning would fire for every repository on this `binarySource`.
     logger.once.debug(
       { constraint: ghActionsLockConstraint },
       'Not installing the `gh-actions-lock` extension, and ignoring `constraints.ghActionsLock`, because `binarySource=global` leaves tooling to the administrator',
     );
-  } else {
-    // `--force` makes an install a no-op when the specified version is already installed
-    if (ghActionsLockConstraint) {
-      commands.unshift(
-        `gh extension install ${extensionName} --force --pin ${quote(ghActionsLockConstraint)}`,
-      );
-    } else {
-      commands.unshift(`gh extension install ${extensionName} --force`);
-    }
   }
+  const env = { ...tokenEnv, ...install?.env };
+
+  const execOptions: ExecOptions = {
+    // The tool rescans every workflow, so it runs from the repository root
+    cwd: GlobalConfig.get('localDir'),
+    // `extraEnv` is what forwards a variable into the Docker sidecar, but on its own it is only a default: `getChildEnv` lets a same-named variable in Renovate's own environment win.
+    // The token we resolved from the host rules must not be shadowed by an ambient `GH_TOKEN`, nor the extension directory by an ambient `XDG_DATA_HOME`, so force them as well.
+    extraEnv: env,
+    env,
+    toolConstraints: [{ toolName: 'gh', constraint: ghConstraint }],
+    docker: {},
+  };
 
   try {
     await exec(commands, execOptions);
@@ -296,6 +293,12 @@ export async function updateActionsLockfile(
 
   // `actions-lock` may annotate workflows being managed with i.e. `# This workflow is managed by gh actions-lock.`, even if there were no updates to that workflow in this branch.
   // We should diff against Git, rather than against the branch's own updated package files, otherwise those annotations are left behind as uncommitted changes
+  // Another tool of this branch, such as `gh aw compile`, may have rewritten a workflow already, which it reports itself
+  for (const file of coerceArray<FileChange>(config.updatedArtifacts)) {
+    if (file.type === 'addition') {
+      writtenContent.set(file.path, file.contents!.toString());
+    }
+  }
   const status = await getRepoStatus();
   for (const path of status.modified) {
     // ignore the lockfile, as we've already committed it above, and any file which another manager owns
@@ -304,7 +307,7 @@ export async function updateActionsLockfile(
     }
 
     const newContent = await readLocalFile(path, 'utf8');
-    // Whatever this branch wrote is committed as a package file update already, so only content which the tool changed on top of it is an artifact
+    // Whatever this branch wrote is committed as a package file update or artifact already, so only content which the tool changed on top of it is an artifact
     if (!newContent || newContent === writtenContent.get(path)) {
       continue;
     }
